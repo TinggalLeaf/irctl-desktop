@@ -10,17 +10,9 @@ jobs:
   t:
     runs-on: ubuntu-latest
     steps:
-      - name: Bisect update-release payload fields
+      - name: Test cross-run asset upload with error output
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REL: repos/${{ github.repository }}/releases/368655967
         run: |
-          set +e
-          t() { echo "=== $1 ==="; shift; gh api -X PATCH "$REL" "$@" --jq .name 2>&1 | tail -2; }
-          t "rename only"            -f name="Release v0.1.1"
-          t "make_latest legacy"     -f make_latest=legacy
-          t "make_latest true"       -F make_latest=true
-          t "tag+target"             -f tag_name=v0.1.1 -f target_commitish=9f0948c8aa166ac6abbdb15824421bf26bed4c6d
-          t "body+gennotes"          -f body="x" -F generate_release_notes=true
-          t "draft+prerelease"       -F draft=false -F prerelease=false
-          t "full softprops-like"    -f tag_name=v0.1.1 -f target_commitish=9f0948c8aa166ac6abbdb15824421bf26bed4c6d -f name="Release v0.1.1" -f body="x" -F draft=false -F prerelease=false -F generate_release_notes=true -f make_latest=legacy
+          echo dummy > dummy.txt
+          gh release upload v0.1.1 dummy.txt --clobber 2>&1; echo "upload exit: $?"
