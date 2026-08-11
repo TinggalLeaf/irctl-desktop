@@ -29,7 +29,7 @@ export interface RtSample {
   hex: string;
 }
 
-const MAX_SAMPLES = 500;
+const MAX_SAMPLES = 2000;
 
 function bytesToHex(b: number[]): string {
   return b.map((x) => x.toString(16).padStart(2, '0').toUpperCase()).join(' ');

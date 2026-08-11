@@ -154,6 +154,8 @@ fn emit_event(app: &AppHandle, payload: serde_json::Value) {
 
 /// 帧投递：入 inbox 唤醒等待中的命令，同时 emit 事件；学成帧清除学习超时
 fn dispatch_frame(app: &AppHandle, shared: &SerialShared, frame: Frame) {
+    #[cfg(debug_assertions)]
+    eprintln!("[ir] frame: {frame:?}");
     let payload = match &frame {
         Frame::Ack(code) => serde_json::json!({ "kind": "ack", "code": code }),
         Frame::Blob { prefix, blob } => {
@@ -187,92 +189,96 @@ fn dispatch_frame(app: &AppHandle, shared: &SerialShared, frame: Frame) {
 
 /// 从接收缓冲区尽力解析帧；不完整帧保留等待后续数据，停滞超时按 raw 冲刷
 fn parse_buffer(app: &AppHandle, shared: &SerialShared, buf: &mut Vec<u8>, last_data: Instant) {
-    loop {
-        let Some(&b0) = buf.first() else { return };
-        match b0 {
-            CMD_READ_SLOT | CMD_LEARN_BLOB => {
-                if buf.len() < 3 {
-                    if last_data.elapsed() > FRAME_STALL {
-                        let raw = std::mem::take(buf);
-                        dispatch_frame(app, shared, Frame::Raw(raw));
-                    }
-                    return; // 等长度字节
-                }
-                let len = ((buf[1] as usize) << 8) | buf[2] as usize;
-                if !(6..=MAX_BLOB_LEN).contains(&len) {
-                    // 长度非法：失步，丢弃首字节按 raw 透出后继续对齐
-                    let byte = buf.remove(0);
-                    dispatch_frame(app, shared, Frame::Raw(vec![byte]));
-                    continue;
-                }
-                let total = 1 + len; // 前缀 + blob（len 含长度字节自身）
-                if buf.len() < total {
-                    if last_data.elapsed() > FRAME_STALL {
-                        let raw = std::mem::take(buf);
-                        dispatch_frame(app, shared, Frame::Raw(raw));
-                    }
-                    return; // 等数据字节
-                }
-                let blob: Vec<u8> = buf[1..total].to_vec();
-                buf.drain(..total);
-                dispatch_frame(app, shared, Frame::Blob { prefix: b0, blob });
-            }
-            CMD_SCENE_SET | CMD_SCENE_QUERY | CMD_SCENE_POWER => {
-                // 回显帧：接收空闲 ECHO_IDLE 即视为帧尾
-                if last_data.elapsed() >= ECHO_IDLE {
-                    let data: Vec<u8> = buf[1..].to_vec();
-                    buf.clear();
-                    dispatch_frame(app, shared, Frame::Echo { prefix: b0, data });
-                }
-                return;
-            }
-            RESP_ERROR => {
-                buf.remove(0);
-                dispatch_frame(app, shared, Frame::Error);
-            }
-            // E9 读槽应答为无前缀帧（真机实测）：[len_hi len_lo][data][FF FF FF FF]，
-            // len 含长度字节自身；len_hi ≤ 0x08（MAX_BLOB_LEN=2048），与指令/ack 字节（≥0xE0）无冲突
-            0x00..=0x08 => {
-                if buf.len() < 2 {
-                    if last_data.elapsed() > FRAME_STALL {
-                        let raw = std::mem::take(buf);
-                        dispatch_frame(app, shared, Frame::Raw(raw));
-                    }
-                    return; // 等长度低字节
-                }
-                let len = ((buf[0] as usize) << 8) | buf[1] as usize;
-                if !(6..=MAX_BLOB_LEN).contains(&len) {
-                    let byte = buf.remove(0);
-                    dispatch_frame(app, shared, Frame::Raw(vec![byte]));
-                    continue;
-                }
-                if buf.len() < len {
-                    if last_data.elapsed() > FRAME_STALL {
-                        let raw = std::mem::take(buf);
-                        dispatch_frame(app, shared, Frame::Raw(raw));
-                    }
-                    return; // 等数据字节
-                }
-                if buf[len - 4..len] != [0xFF, 0xFF, 0xFF, 0xFF] {
-                    // 结尾校验失败：失步，丢弃首字节继续对齐
-                    let byte = buf.remove(0);
-                    dispatch_frame(app, shared, Frame::Raw(vec![byte]));
-                    continue;
-                }
-                let blob: Vec<u8> = buf[..len].to_vec();
-                buf.drain(..len);
-                // 无前缀 blob：学习进行中按 EB 学成帧投递，否则按 E9 读槽帧投递
-                let prefix = if shared.inner.lock().unwrap().learn_deadline.is_some() {
-                    CMD_LEARN_BLOB
+    let learning = shared.inner.lock().unwrap().learn_deadline.is_some();
+    let idle = last_data.elapsed();
+    while let Some(frame) = next_frame(buf, idle, learning) {
+        dispatch_frame(app, shared, frame);
+    }
+}
+
+/// 帧解析状态机（纯函数，可单测）：从 buf 头部解析/冲刷出一帧。
+/// `idle` 为距上次收到字节的时长；`learning` 表示学习进行中
+/// （此时无前缀 blob 按 EB 学成帧投递，否则按 E9 读槽帧投递）。
+/// 返回 None 表示数据不足、等待更多字节或空闲切帧时机。
+fn next_frame(buf: &mut Vec<u8>, idle: Duration, learning: bool) -> Option<Frame> {
+    let &b0 = buf.first()?;
+    match b0 {
+        CMD_READ_SLOT | CMD_LEARN_BLOB => {
+            if buf.len() < 3 {
+                // 等长度字节；停滞则冲刷
+                return if idle > FRAME_STALL {
+                    Some(Frame::Raw(std::mem::take(buf)))
                 } else {
-                    CMD_READ_SLOT
+                    None
                 };
-                dispatch_frame(app, shared, Frame::Blob { prefix, blob });
             }
-            other => {
-                buf.remove(0);
-                dispatch_frame(app, shared, Frame::Ack(other));
+            let len = ((buf[1] as usize) << 8) | buf[2] as usize;
+            if !(6..=MAX_BLOB_LEN).contains(&len) {
+                // 长度非法：失步，丢弃首字节按 raw 透出后继续对齐
+                let byte = buf.remove(0);
+                return Some(Frame::Raw(vec![byte]));
             }
+            let total = 1 + len; // 前缀 + blob（len 含长度字节自身）
+            if buf.len() < total {
+                return if idle > FRAME_STALL {
+                    Some(Frame::Raw(std::mem::take(buf)))
+                } else {
+                    None
+                };
+            }
+            let blob: Vec<u8> = buf[1..total].to_vec();
+            buf.drain(..total);
+            Some(Frame::Blob { prefix: b0, blob })
+        }
+        CMD_SCENE_SET | CMD_SCENE_QUERY | CMD_SCENE_POWER => {
+            // 回显帧：接收空闲 ECHO_IDLE 即视为帧尾
+            if idle >= ECHO_IDLE {
+                let data: Vec<u8> = buf[1..].to_vec();
+                buf.clear();
+                Some(Frame::Echo { prefix: b0, data })
+            } else {
+                None
+            }
+        }
+        RESP_ERROR => {
+            buf.remove(0);
+            Some(Frame::Error)
+        }
+        // E9 读槽应答为无前缀帧（真机实测）：[len_hi len_lo][data][FF FF FF FF]，
+        // len 含长度字节自身；len_hi ≤ 0x08（MAX_BLOB_LEN=2048），与指令/ack 字节（≥0xE0）无冲突
+        0x00..=0x08 => {
+            if buf.len() < 2 {
+                return if idle > FRAME_STALL {
+                    Some(Frame::Raw(std::mem::take(buf)))
+                } else {
+                    None
+                };
+            }
+            let len = ((buf[0] as usize) << 8) | buf[1] as usize;
+            if !(6..=MAX_BLOB_LEN).contains(&len) {
+                let byte = buf.remove(0);
+                return Some(Frame::Raw(vec![byte]));
+            }
+            if buf.len() < len {
+                return if idle > FRAME_STALL {
+                    Some(Frame::Raw(std::mem::take(buf)))
+                } else {
+                    None
+                };
+            }
+            if buf[len - 4..len] != [0xFF, 0xFF, 0xFF, 0xFF] {
+                // 结尾校验失败：失步，丢弃首字节继续对齐
+                let byte = buf.remove(0);
+                return Some(Frame::Raw(vec![byte]));
+            }
+            let blob: Vec<u8> = buf[..len].to_vec();
+            buf.drain(..len);
+            let prefix = if learning { CMD_LEARN_BLOB } else { CMD_READ_SLOT };
+            Some(Frame::Blob { prefix, blob })
+        }
+        other => {
+            buf.remove(0);
+            Some(Frame::Ack(other))
         }
     }
 }
@@ -769,4 +775,127 @@ pub async fn ir_scene_stop(state: State<'_, SerialManager>) -> Result<(), String
     // 执行中再发 FD 即终止
     write_only(&state.shared, &[CMD_SCENE_RUN])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! 帧解析状态机测试，使用真机实采数据（testdata/slot1.hex：E9 01 读出的 NEC 码，286 字节无前缀）
+    use super::*;
+
+    const WAIT: Duration = Duration::from_millis(0);
+    const STALL: Duration = Duration::from_millis(2000);
+
+    fn slot1_bytes() -> Vec<u8> {
+        let hex = include_str!("../testdata/slot1.hex").trim().to_string();
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// 逐字节喂入，收集解析出的全部帧（模拟串口字节流）
+    fn parse_stream(bytes: &[u8], learning: bool) -> Vec<Frame> {
+        let mut buf = Vec::new();
+        let mut frames = Vec::new();
+        for chunk in bytes.chunks(7) {
+            buf.extend_from_slice(chunk);
+            while let Some(f) = next_frame(&mut buf, WAIT, learning) {
+                frames.push(f);
+            }
+        }
+        // 收尾：模拟停滞冲刷
+        while let Some(f) = next_frame(&mut buf, STALL, learning) {
+            frames.push(f);
+        }
+        frames
+    }
+
+    #[test]
+    fn e9_read_slot_response_no_prefix() {
+        let data = slot1_bytes();
+        assert_eq!(data.len(), 286);
+        let frames = parse_stream(&data, false);
+        assert_eq!(frames.len(), 1, "应解析出恰好一帧，实际 {frames:?}");
+        match &frames[0] {
+            Frame::Blob { prefix, blob } => {
+                assert_eq!(*prefix, CMD_READ_SLOT);
+                assert_eq!(blob.len(), 286);
+                assert_eq!(&blob[..2], &[0x01, 0x1E]);
+                assert_eq!(&blob[282..], &[0xFF, 0xFF, 0xFF, 0xFF]);
+            }
+            other => panic!("应为 Blob 帧，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_prefix_blob_while_learning_is_learned_frame() {
+        let data = slot1_bytes();
+        let frames = parse_stream(&data, true);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            frames[0],
+            Frame::Blob { prefix: CMD_LEARN_BLOB, .. }
+        ));
+    }
+
+    #[test]
+    fn eb_prefixed_learned_blob() {
+        let mut data = vec![CMD_LEARN_BLOB];
+        data.extend_from_slice(&slot1_bytes());
+        let frames = parse_stream(&data, true);
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            Frame::Blob { prefix, blob } => {
+                assert_eq!(*prefix, CMD_LEARN_BLOB);
+                assert_eq!(blob.len(), 286);
+            }
+            other => panic!("应为 Blob 帧，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eb_entry_echo_then_prefixed_blob() {
+        // 真机行为：EB 进入学习先回单字节 EB 回执，学成后再回 EB+blob
+        let mut data = vec![CMD_LEARN_BLOB];
+        data.push(CMD_LEARN_BLOB);
+        data.extend_from_slice(&slot1_bytes());
+        let frames = parse_stream(&data, true);
+        // 第一个 EB 回执：与后续 EB 拼接成长度 0xEBEB 非法 → 失步丢弃为 raw
+        // 随后 EB+blob 正常解析
+        assert_eq!(frames.len(), 2, "实际 {frames:?}");
+        assert!(matches!(frames[0], Frame::Raw(_)));
+        assert!(matches!(
+            frames[1],
+            Frame::Blob { prefix: CMD_LEARN_BLOB, .. }
+        ));
+    }
+
+    #[test]
+    fn lone_eb_entry_echo_flushed_as_raw_after_stall() {
+        let frames = parse_stream(&[CMD_LEARN_BLOB], true);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(&frames[0], Frame::Raw(b) if b == &vec![CMD_LEARN_BLOB]));
+    }
+
+    #[test]
+    fn ack_and_error_bytes() {
+        let frames = parse_stream(&[CMD_TEST, CMD_LEARN_CANCEL, RESP_ERROR], false);
+        assert_eq!(frames.len(), 3);
+        assert!(matches!(frames[0], Frame::Ack(CMD_TEST)));
+        assert!(matches!(frames[1], Frame::Ack(CMD_LEARN_CANCEL)));
+        assert!(matches!(frames[2], Frame::Error));
+    }
+
+    #[test]
+    fn garbage_resyncs_to_blob() {
+        // 前面混入噪声字节，解析器应失步丢弃并最终对齐到 blob
+        let mut data = vec![0x13, 0x55, 0x00, 0x09, 0xAB];
+        data.extend_from_slice(&slot1_bytes());
+        let frames = parse_stream(&data, false);
+        let blobs = frames
+            .iter()
+            .filter(|f| matches!(f, Frame::Blob { .. }))
+            .count();
+        assert_eq!(blobs, 1, "噪声后应对齐出一帧 blob，实际 {frames:?}");
+    }
 }
