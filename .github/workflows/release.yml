@@ -22,14 +22,21 @@ jobs:
   release-please:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
     steps:
       - uses: googleapis/release-please-action@v4
+        id: rp
         with:
           release-type: simple
           # release-please-config.json / .release-please-manifest.json 位于仓库根目录
 
   build:
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    # 合并 Release PR 后 release-please 在同一次运行里建好 tag/Release，直接接力构建，
+    # 不依赖 tag push 事件（GITHUB_TOKEN 创建的 tag 不会触发新工作流）
+    needs: release-please
+    if: always() && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && needs.release-please.outputs.release_created == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -42,9 +49,12 @@ jobs:
           - { os: macos-latest,    target: aarch64-apple-darwin,      label: macos-arm64 }
     runs-on: ${{ matrix.os }}
     env:
-      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || (github.ref == 'refs/heads/main' && needs.release-please.outputs.tag_name) || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 手动补发历史 tag 时检出该 tag，其余情况用当前 ref
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - uses: pnpm/action-setup@v4
         with:
