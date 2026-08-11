@@ -26,6 +26,11 @@ const router = createRouter({
       meta: { title: '接收学习', icon: 'Download', needHw: true },
     },
     {
+      path: '/realtime',
+      component: () => import('../views/RealtimeView.vue'),
+      meta: { title: '实时红外', icon: 'TrendCharts', needHw: true },
+    },
+    {
       path: '/transmit',
       component: () => import('../views/TransmitView.vue'),
       meta: { title: '发射控制', icon: 'Promotion', needHw: true },

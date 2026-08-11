@@ -132,6 +132,15 @@ function clearCodelibCache() {
     <el-card shadow="never">
       <template #header><span class="sec-title">接收</span></template>
       <el-form label-width="110px" class="sec-form">
+        <el-form-item label="学习模式">
+          <el-radio-group v-model="settings.receive.learnMode">
+            <el-radio-button value="software">软件（默认）</el-radio-button>
+            <el-radio-button value="hardware">硬件</el-radio-button>
+          </el-radio-group>
+          <span class="form-tip">
+            软件：EB 出码 + 软件解码，带实时图表；硬件：E0 学习存入模块槽位
+          </span>
+        </el-form-item>
         <el-form-item label="解码容差">
           <el-input-number v-model="settings.receive.tolerance" :min="5" :max="50" />
           <span class="form-tip">%</span>

@@ -13,17 +13,22 @@ import type { DecodedFrame, IrBlob, PulseTrain } from '../types/ir';
 import { useHardwareStore } from '../stores/hardware';
 import { useSettingsStore } from '../stores/settings';
 import { usePresetsStore } from '../stores/presets';
+import { useRealtimeStore } from '../stores/realtime';
 import ScopeCanvas from '../components/ScopeCanvas.vue';
 import FftSpectrum from '../components/FftSpectrum.vue';
 import PulseMeasureTable from '../components/PulseMeasureTable.vue';
+import RealtimePanel from '../components/RealtimePanel.vue';
 
 defineOptions({ name: 'ReceiveView' });
 
 const hwStore = useHardwareStore();
 const settingsStore = useSettingsStore();
 const presetsStore = usePresetsStore();
+const rt = useRealtimeStore();
 
 const hwReady = computed(() => hwStore.connected);
+/** 学习模式：software=EB 出码+软件解码（默认，实时图表）；hardware=E0 学习入模块槽位 */
+const isSoftware = computed(() => settingsStore.receive.learnMode === 'software');
 
 // ---------- 信号数据 ----------
 const blob = ref<IrBlob | null>(null);
@@ -48,15 +53,15 @@ function errMsg(e: unknown): string {
   return typeof e === 'string' ? e : (e as Error)?.message ?? String(e);
 }
 
-/** 模块 blob → µs 时间线（走 convert 库 module 解析） */
-function handleBlob(b: IrBlob, tip: string) {
+/** 模块 blob → µs 时间线（走 convert 库 module 解析）；silent 时不弹提示（连发场景） */
+function handleBlob(b: IrBlob, tip: string, silent = false) {
   blob.value = b;
   try {
     const sig = parseToCanonical(bytesToHex(b), 'module');
     train.value = { carrierHz: sig.carrierHz, pulses: sig.pulses };
     rawText.value = formatFromCanonical(sig, 'raw');
     rawError.value = '';
-    ElMessage.success(tip);
+    if (!silent && tip) ElMessage.success(tip);
   } catch (e) {
     ElMessage.error(`blob 解析失败：${errMsg(e)}`);
   }
@@ -66,11 +71,29 @@ function handleBlob(b: IrBlob, tip: string) {
 const learning = ref(false);
 const countdown = ref(0);
 let countdownTimer: ReturnType<typeof setInterval> | null = null;
+/** 软件模式：首次学成弹提示，后续按键静默刷新波形 */
+let learnedOnce = false;
 
 const slotNo = ref(1);
 const readingSlot = ref(false);
 
-async function startLearn(slot?: number) {
+/** 开始学习：软件模式走 realtime store 的 EB 连续捕获；硬件模式 E0 入槽 */
+async function startLearn() {
+  if (isSoftware.value) {
+    try {
+      await rt.start();
+      learning.value = true;
+      learnedOnce = false;
+    } catch (e) {
+      ElMessage.error(`启动学习失败：${errMsg(e)}`);
+    }
+    return;
+  }
+  await startSlotLearn(slotNo.value);
+}
+
+/** 硬件模式：E0 学习到模块槽位 */
+async function startSlotLearn(slot: number) {
   try {
     await hw.learnStart(slot);
     learning.value = true;
@@ -93,9 +116,14 @@ function stopLearning() {
     clearInterval(countdownTimer);
     countdownTimer = null;
   }
+  if (isSoftware.value) void rt.stop();
 }
 
 async function cancelLearn() {
+  if (isSoftware.value) {
+    stopLearning();
+    return;
+  }
   try {
     await hw.learnCancel();
   } catch {
@@ -122,13 +150,20 @@ let unlisten: UnlistenFn | null = null;
 onMounted(async () => {
   unlisten = await onIrEvent((p) => {
     if (p.kind === 'learned' && p.blob) {
+      // 软件模式：学习中每帧都刷新波形，仅首次弹提示；捕获循环由 rt store 维持
+      if (learning.value && isSoftware.value) {
+        handleBlob(
+          p.blob,
+          learnedOnce ? '' : `学习成功，收到 ${p.blob.length} 字节`,
+          learnedOnce,
+        );
+        learnedOnce = true;
+      }
+    } else if (p.kind === 'ack' && learning.value && !isSoftware.value && p.code === 0xe0) {
+      // 硬件模式 E0 学习到槽位：学成回 E0 ack（其余 ack 一律不算，防止误判）
       stopLearning();
-      handleBlob(p.blob, `学习成功，收到 ${p.blob.length} 字节`);
-    } else if (p.kind === 'ack' && learning.value) {
-      // E0 学习到槽位：学成回 ack
-      stopLearning();
-      ElMessage.success(`学习成功，已写入槽位 ${slotNo.value}`);
-    } else if (p.kind === 'error' && learning.value) {
+      ElMessage.success(`学习成功，已写入槽位 ${slotNo.value}，可点击「读取槽位」查看波形`);
+    } else if (p.kind === 'error' && learning.value && !isSoftware.value) {
       stopLearning();
       ElMessage.error(p.message ?? '学习失败');
     }
@@ -138,6 +173,8 @@ onMounted(async () => {
 onUnmounted(() => {
   unlisten?.();
   if (countdownTimer) clearInterval(countdownTimer);
+  // 离开页面停止软件捕获：模块在学习中只认 E2，挂着会阻塞发射等指令
+  if (learning.value && isSoftware.value) void rt.stop();
 });
 
 // ---------- 协议识别（容差/毛刺阈值来自设置，可页面临时调整） ----------
@@ -289,23 +326,24 @@ function confirmSave() {
           :disabled="!hwReady || learning"
           @click="startLearn()"
         >
-          <el-icon><VideoPlay /></el-icon>&nbsp;开始学习
+          <el-icon><VideoPlay /></el-icon>&nbsp;开始学习{{ isSoftware ? '（软件）' : '（硬件入槽）' }}
         </el-button>
         <el-button v-if="learning" type="danger" @click="cancelLearn">
-          <el-icon><CircleClose /></el-icon>&nbsp;取消学习（{{ countdown }}s）
+          <el-icon><CircleClose /></el-icon>&nbsp;{{ isSoftware ? '停止学习' : `取消学习（${countdown}s）` }}
         </el-button>
-        <el-divider direction="vertical" />
-        <el-input-number
-          v-model="slotNo"
-          :min="1"
-          :max="248"
-          :disabled="!hwReady || learning"
-          class="slot-input"
-        />
-        <el-button :disabled="!hwReady || learning" @click="startLearn(slotNo)">学习到槽位</el-button>
-        <el-button :loading="readingSlot" :disabled="!hwReady || learning" @click="readSlot">
-          读取槽位
-        </el-button>
+        <template v-if="!isSoftware">
+          <el-divider direction="vertical" />
+          <el-input-number
+            v-model="slotNo"
+            :min="1"
+            :max="248"
+            :disabled="!hwReady || learning"
+            class="slot-input"
+          />
+          <el-button :loading="readingSlot" :disabled="!hwReady || learning" @click="readSlot">
+            读取槽位
+          </el-button>
+        </template>
         <el-divider direction="vertical" />
         <el-dropdown :disabled="!train" @command="doExport">
           <el-button :disabled="!train">
@@ -327,6 +365,17 @@ function confirmSave() {
           学习中…请将遥控器对准接收头并按键
         </el-tag>
       </div>
+    </el-card>
+
+    <!-- 软件学习模式：实时捕获图表（载波频段不过滤 + 帧统计） -->
+    <el-card v-if="learning && isSoftware" shadow="never" class="rt-card">
+      <template #header>
+        <div class="card-header">
+          <span>实时捕获（学习中 · {{ rt.totalCount }} 帧）</span>
+          <span class="text-secondary header-hint">按遥控器任意按键，波形与统计实时刷新；「停止学习」结束</span>
+        </div>
+      </template>
+      <RealtimePanel :samples="rt.samples" />
     </el-card>
 
     <!-- 主区域：左示波器 / 右频谱+测量 -->
@@ -505,6 +554,10 @@ function confirmSave() {
   .learn-tag {
     margin-left: auto;
   }
+}
+
+.rt-card {
+  margin-bottom: 12px;
 }
 
 .main-grid {

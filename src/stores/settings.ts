@@ -35,6 +35,8 @@ export interface ReceiveSettings {
   tolerance: number;
   /** 毛刺过滤 µs */
   glitchFilterUs: number;
+  /** 学习模式：software=EB 出码+软件解码（默认）；hardware=E0 学习入模块槽位 */
+  learnMode: 'software' | 'hardware';
 }
 export interface ThemeSettings {
   mode: ThemeMode;
@@ -81,7 +83,7 @@ function defaults(): SettingsState {
   return {
     serial: { port: '', baud: 9600, autoReconnect: true },
     transmit: { repeatCount: 1, intervalMs: 100 },
-    receive: { tolerance: 25, glitchFilterUs: 80 },
+    receive: { tolerance: 25, glitchFilterUs: 80, learnMode: 'software' },
     theme: {
       mode: 'light',
       palette: 'aurora',

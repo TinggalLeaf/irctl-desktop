@@ -230,6 +230,45 @@ fn parse_buffer(app: &AppHandle, shared: &SerialShared, buf: &mut Vec<u8>, last_
                 buf.remove(0);
                 dispatch_frame(app, shared, Frame::Error);
             }
+            // E9 读槽应答为无前缀帧（真机实测）：[len_hi len_lo][data][FF FF FF FF]，
+            // len 含长度字节自身；len_hi ≤ 0x08（MAX_BLOB_LEN=2048），与指令/ack 字节（≥0xE0）无冲突
+            0x00..=0x08 => {
+                if buf.len() < 2 {
+                    if last_data.elapsed() > FRAME_STALL {
+                        let raw = std::mem::take(buf);
+                        dispatch_frame(app, shared, Frame::Raw(raw));
+                    }
+                    return; // 等长度低字节
+                }
+                let len = ((buf[0] as usize) << 8) | buf[1] as usize;
+                if !(6..=MAX_BLOB_LEN).contains(&len) {
+                    let byte = buf.remove(0);
+                    dispatch_frame(app, shared, Frame::Raw(vec![byte]));
+                    continue;
+                }
+                if buf.len() < len {
+                    if last_data.elapsed() > FRAME_STALL {
+                        let raw = std::mem::take(buf);
+                        dispatch_frame(app, shared, Frame::Raw(raw));
+                    }
+                    return; // 等数据字节
+                }
+                if buf[len - 4..len] != [0xFF, 0xFF, 0xFF, 0xFF] {
+                    // 结尾校验失败：失步，丢弃首字节继续对齐
+                    let byte = buf.remove(0);
+                    dispatch_frame(app, shared, Frame::Raw(vec![byte]));
+                    continue;
+                }
+                let blob: Vec<u8> = buf[..len].to_vec();
+                buf.drain(..len);
+                // 无前缀 blob：学习进行中按 EB 学成帧投递，否则按 E9 读槽帧投递
+                let prefix = if shared.inner.lock().unwrap().learn_deadline.is_some() {
+                    CMD_LEARN_BLOB
+                } else {
+                    CMD_READ_SLOT
+                };
+                dispatch_frame(app, shared, Frame::Blob { prefix, blob });
+            }
             other => {
                 buf.remove(0);
                 dispatch_frame(app, shared, Frame::Ack(other));
@@ -276,6 +315,14 @@ fn reader_loop(app: AppHandle, shared: Arc<SerialShared>, mut port: Box<dyn Seri
             }
         }
         if timeout_hit {
+            // 同步取消模块侧学习态：模块在学习中只认 E2，不取消会卡住后续所有指令
+            {
+                let mut g = shared.inner.lock().unwrap();
+                if let Some(port) = g.port.as_mut() {
+                    let _ = port.write_all(&[CMD_LEARN_CANCEL]);
+                    let _ = port.flush();
+                }
+            }
             emit_event(
                 &app,
                 serde_json::json!({ "kind": "error", "message": "学习超时：30 秒内未收到红外按键信号" }),
@@ -505,6 +552,11 @@ pub async fn ir_open(
     g.reader = Some(handle);
     g.inbox.clear();
     g.learn_deadline = None;
+    // 模块可能滞留在学习态（此前异常退出/超时未取消），学习中只认 E2，先取消其卡死状态
+    if let Some(port) = g.port.as_mut() {
+        let _ = port.write_all(&[CMD_LEARN_CANCEL]);
+        let _ = port.flush();
+    }
     Ok(())
 }
 
