@@ -1,0 +1,117 @@
+// ============================================================
+// irctl-desktop 全局样式与主题系统
+// 主题变量由 settings store 动态写入 document.documentElement：
+//   --el-color-primary 及 light-3/5/7/8/9、dark-2（Monet 派生）
+//   --app-radius / --app-font-size / --app-anim-duration
+// html.dark 启用 Element Plus 暗色；html.oled 在其上覆盖纯黑。
+// ============================================================
+
+:root {
+  // 应用级变量（store 覆写这里的默认值）
+  --app-radius: 8px;
+  --app-font-size: 14px;
+  --app-anim-duration: 0.3s;
+
+  // 桥接到 Element Plus 变量，全局生效
+  --el-border-radius-base: var(--app-radius);
+  --el-border-radius-small: calc(var(--app-radius) * 0.75);
+  --el-font-size-base: var(--app-font-size);
+}
+
+// ---------- 基础 ----------
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family:
+    'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
+    system-ui, -apple-system, sans-serif;
+  font-size: var(--app-font-size);
+  background-color: var(--el-bg-color-page);
+  color: var(--el-text-color-primary);
+  overflow: hidden;
+}
+
+// html 级别平滑过渡：主题切换时背景/边框/文字颜色渐变
+html,
+body,
+.el-card,
+.el-menu,
+.el-aside,
+.el-header,
+.el-main,
+.el-drawer,
+.el-dialog,
+.app-header,
+.hw-chip,
+.quick-entry {
+  transition:
+    background-color var(--app-anim-duration) ease,
+    border-color var(--app-anim-duration) ease,
+    color var(--app-anim-duration) ease;
+}
+
+// ---------- OLED 纯黑（基于 dark 覆写） ----------
+html.oled {
+  background-color: #000;
+  --el-bg-color: #000;
+  --el-bg-color-page: #000;
+  --el-bg-color-overlay: #0b0b0d;
+  --el-fill-color-blank: #000;
+  --el-fill-color: #101012;
+  --el-fill-color-light: #161618;
+  --el-fill-color-lighter: #1b1b1e;
+  --el-fill-color-extra-light: #202024;
+  --el-fill-color-dark: #0b0b0d;
+  --el-fill-color-darker: #080809;
+  --el-border-color: #26262b;
+  --el-border-color-light: #222226;
+  --el-border-color-lighter: #1e1e22;
+  --el-border-color-extra-light: #1a1a1e;
+  --el-mask-color: rgba(0, 0, 0, 0.75);
+}
+
+// ---------- 滚动条 ----------
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--el-border-color-darker, #c0c4cc);
+  border-radius: var(--app-radius);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+// ---------- 路由过渡动画（时长跟随 --app-anim-duration） ----------
+.page-enter-active,
+.page-leave-active {
+  transition:
+    opacity var(--app-anim-duration) ease,
+    transform var(--app-anim-duration) ease;
+}
+.page-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+.page-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+// ---------- 通用工具类 ----------
+.text-secondary {
+  color: var(--el-text-color-secondary);
+}
+.text-primary-color {
+  color: var(--el-color-primary);
+}
+.mono {
+  font-family: 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
+}
