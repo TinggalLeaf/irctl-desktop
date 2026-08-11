@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '要发布的 tag（如 v0.1.0），需已存在'
+        description: '要发布的 tag（如 v0.1.0），需已存在；手动触发时请把 Ref 也选成该 tag（main 上的运行无权上传资产）'
         required: true
 
 permissions:
@@ -22,9 +22,6 @@ jobs:
   release-please:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    outputs:
-      release_created: ${{ steps.rp.outputs.release_created }}
-      tag_name: ${{ steps.rp.outputs.tag_name }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: rp
@@ -32,11 +29,17 @@ jobs:
           release-type: simple
           # release-please-config.json / .release-please-manifest.json 位于仓库根目录
 
+      # 合并 Release PR 后 release-please 已建好 tag/Release，但 GITHUB_TOKEN 创建的
+      # tag 不会再触发 push 事件，且实测 GITHUB_TOKEN 只有在 tag 引用上的运行里才能
+      # 上传 Release 资产（main 上的运行 PATCH/上传均 403），因此显式在新 tag 上派发构建
+      - name: Dispatch build on the new tag
+        if: steps.rp.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run release.yml --ref "${{ steps.rp.outputs.tag_name }}" -f tag="${{ steps.rp.outputs.tag_name }}"
+
   build:
-    # 合并 Release PR 后 release-please 在同一次运行里建好 tag/Release，直接接力构建，
-    # 不依赖 tag push 事件（GITHUB_TOKEN 创建的 tag 不会触发新工作流）
-    needs: release-please
-    if: always() && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && needs.release-please.outputs.release_created == 'true'))
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -49,12 +52,9 @@ jobs:
           - { os: macos-latest,    target: aarch64-apple-darwin,      label: macos-arm64 }
     runs-on: ${{ matrix.os }}
     env:
-      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || (github.ref == 'refs/heads/main' && needs.release-please.outputs.tag_name) || github.ref_name }}
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          # 手动补发历史 tag 时检出该 tag，其余情况用当前 ref
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - uses: pnpm/action-setup@v4
         with:
