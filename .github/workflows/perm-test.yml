@@ -15,4 +15,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo dummy > dummy.txt
-          gh release upload v0.1.1 dummy.txt --clobber 2>&1; echo "upload exit: $?"
+          GH_REPO=${{ github.repository }} gh release upload v0.1.1 dummy.txt --clobber 2>&1; echo "upload exit: $?"
